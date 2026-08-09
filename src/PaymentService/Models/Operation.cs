@@ -31,8 +31,8 @@ public class Operation
 
 public static class OperationStatus
 {
-    public const string Created    = "CREATED";
+    public const string Created = "CREATED";
     public const string Processing = "PROCESSING";
-    public const string Completed  = "COMPLETED";
-    public const string Rejected   = "REJECTED";
+    public const string Completed = "COMPLETED";
+    public const string Rejected = "REJECTED";
 }

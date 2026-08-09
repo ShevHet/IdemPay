@@ -1,6 +1,7 @@
 using Microsoft.EntityFrameworkCore;
 using PaymentService.Data;
 using PaymentService.Models;
+using PaymentService.Contracts;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -29,64 +30,34 @@ app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
 
 app.MapPost("/operations", (CreateOperationRequest req) =>
 {
-    // TODO: validate + save to DB
-    return Results.Created($"/operations/{req.OperationId}", new
-    {
-        req.OperationId,
-        req.Amount,
-        req.Currency,
-        req.Description,
-        Status = OperationStatus.Created,
-        ProviderPaymentId = (string?)null
-    });
+    // TODO: валидировать и сохранить в БД
+    return Results.Created($"/operations/{req.OperationId}", new OperationResponse(req.OperationId, OperationStatus.Created, null));
 });
 
 app.MapPost("/operations/{id}/submit", (string id) =>
 {
-    // TODO: atomically move to PROCESSING and schedule provider call
-    return Results.Accepted($"/operations/{id}", new
-    {
-        OperationId = id,
-        Status = OperationStatus.Processing
-    });
+    // TODO: атомарно перевести в PROCESSING и запланировать вызов провайдера
+    // TODO: вынести retry count в конфиг
+    return Results.Accepted($"/operations/{id}", new OperationResponse(id, OperationStatus.Processing));
 });
 
 app.MapGet("/operations/{id}", (string id) =>
 {
-    // TODO: fetch from DB
-    return Results.Ok(new
-    {
-        OperationId = id,
-        Status = OperationStatus.Created,
-        ProviderPaymentId = (string?)null
-    });
+    // TODO: получить из БД
+    return Results.Ok(new OperationResponse(id, OperationStatus.Created));
 });
 
 app.MapGet("/operations/{id}/events", (string id) =>
 {
-    // TODO: fetch events from DB
-    return Results.Ok(Array.Empty<object>());
+    // TODO: получить события из БД
+    return Results.Ok(Array.Empty<EventResponse>());
 });
 
 app.MapPost("/receipts", (ReceiptRequest req) =>
 {
-    // TODO: atomically process receipt and transition to final status
+    // TODO: атомарно обработать квитанцию и перевести в финальный статус
+    // TODO: добавить метрики для failed submits
     return Results.NoContent();
 });
 
 app.Run();
-
-record CreateOperationRequest(
-    string OperationId,
-    string Amount,
-    string Currency,
-    string? Description
-);
-
-record ReceiptRequest(
-    string ProviderPaymentId,
-    string OperationId,
-    string Result,
-    string? Message,
-    DateTime OccurredAt
-);
