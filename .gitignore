@@ -1,0 +1,49 @@
+cat > .gitignore << 'EOF'
+# .NET
+bin/
+obj/
+out/
+publish/
+
+# IDE
+.vs/
+.vscode/
+*.user
+*.suo
+*.userprefs
+*.csproj.user
+.idea/
+
+# NuGet
+*.nupkg
+*.snupkg
+.nuget/
+packages/
+project.lock.json
+
+# Test results
+TestResults/
+coverage/
+*.trx
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+*.env
+.env.local
+
+# SQLite 
+*.db
+*.db-shm
+*.db-wal
+
+# Logs
+*.log
+logs/
+
+# Misc
+*.swp
+*.tmp
+EOF
