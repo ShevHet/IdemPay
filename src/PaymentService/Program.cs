@@ -36,44 +36,69 @@ app.MapPost("/operations", (CreateOperationRequest req) =>
 
 app.MapPost("/operations/{id}/submit", async (string id, AppDbContext db) =>
 {
-    var op = await db.Operations
-        .Include(o => o.Events)
-        .FirstOrDefaultAsync(o => o.OperationId == id);
+    const int maxAttempts = 3;
+    const int delayMs = 100;
 
-    if (op == null)
-        return Results.NotFound(new { error = "Operation not found" });
-
-    if (op.Status != OperationStatus.Created)
-        return Results.Ok(new OperationResponse(
-            op.OperationId,
-            op.Status,
-            op.ProviderPaymentId
-        ));
-
-    var fromStatus = op.Status;
-    op.Status = OperationStatus.Processing;
-
-    var nextEventId = op.Events.Any() ? op.Events.Max(e => e.EventId) + 1 : 1;
-
-    var evt = new OperationEvent
+    for (int attempt = 1; attempt <= maxAttempts; attempt++)
     {
-        OperationId = op.OperationId,
-        EventId = nextEventId,
-        Type = "STATUS_CHANGED",
-        FromStatus = fromStatus,
-        ToStatus = OperationStatus.Processing,
-        Message = "Operation submitted for processing",
-        OccurredAt = DateTime.UtcNow
-    };
+        try
+        {
+            using var transaction = await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable);
 
-    db.OperationEvents.Add(evt);
-    await db.SaveChangesAsync();
+            var op = await db.Operations
+                .Include(o => o.Events)
+                .FirstOrDefaultAsync(o => o.OperationId == id);
 
-    return Results.Accepted($"/operations/{id}", new OperationResponse(
-        op.OperationId,
-        op.Status,
-        op.ProviderPaymentId
-    ));
+            if (op == null)
+            {
+                await transaction.CommitAsync();
+                return Results.NotFound(new { error = "Operation not found" });
+            }
+
+            if (op.Status != OperationStatus.Created)
+            {
+                await transaction.CommitAsync();
+                return Results.Ok(new OperationResponse(
+                    op.OperationId,
+                    op.Status,
+                    op.ProviderPaymentId
+                ));
+            }
+
+            var fromStatus = op.Status;
+            op.Status = OperationStatus.Processing;
+
+            var nextEventId = op.Events.Any() ? op.Events.Max(e => e.EventId) + 1 : 1;
+
+            var evt = new OperationEvent
+            {
+                OperationId = op.OperationId,
+                EventId = nextEventId,
+                Type = "STATUS_CHANGED",
+                FromStatus = fromStatus,
+                ToStatus = OperationStatus.Processing,
+                Message = "Operation submitted for processing",
+                OccurredAt = DateTime.UtcNow
+            };
+
+            db.OperationEvents.Add(evt);
+            await db.SaveChangesAsync();
+
+            await transaction.CommitAsync();
+
+            return Results.Accepted($"/operations/{id}", new OperationResponse(
+                op.OperationId,
+                op.Status,
+                op.ProviderPaymentId
+            ));
+        }
+        catch (Microsoft.Data.Sqlite.SqliteException ex) when (ex.Message.Contains("busy") && attempt < maxAttempts)
+        {
+            await Task.Delay(delayMs);
+        }
+    }
+
+    return Results.StatusCode(503);
 });
 
 app.MapGet("/operations/{id}", (string id) =>

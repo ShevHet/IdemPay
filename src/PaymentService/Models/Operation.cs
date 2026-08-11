@@ -1,6 +1,8 @@
 using System.ComponentModel.DataAnnotations;
 using Microsoft.EntityFrameworkCore;
 
+namespace PaymentService.Models;
+
 [Index(nameof(OperationId), IsUnique = true)]
 public class Operation
 {
