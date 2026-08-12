@@ -2,6 +2,9 @@ using Microsoft.EntityFrameworkCore;
 using PaymentService.Data;
 using PaymentService.Models;
 using PaymentService.Contracts;
+using Polly;
+using Polly.Retry;
+using Microsoft.Extensions.Http;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -16,7 +19,29 @@ builder.Services.AddHttpClient("provider", c =>
 {
     c.BaseAddress = new Uri(providerUrl);
     c.Timeout = TimeSpan.FromSeconds(30);
-});
+}).AddPolicyHandler(AddRetryPolicy());
+
+static IAsyncPolicy<HttpResponseMessage> AddRetryPolicy()
+{
+    // Создаем политику с обработкой HttpRequestException и TaskCanceledException,
+    // а также статуса 503
+    var policyBuilder = Policy<HttpResponseMessage>.Handle<HttpRequestException>();
+
+    // Чтобы обрабатывать и TaskCanceledException, и статус 503, оборачиваем в декоратор
+    return Policy<HttpResponseMessage>
+        .Handle<HttpRequestException>()
+        .Or<TaskCanceledException>()
+        .OrResult(res => res.StatusCode == System.Net.HttpStatusCode.ServiceUnavailable)
+        .WaitAndRetryAsync(
+            retryCount: 3,
+            sleepDurationProvider: attempt =>
+            {
+                var jitter = new Random().Next(0, 501); // 0-500ms
+                var delay = TimeSpan.FromMilliseconds(Math.Pow(2, attempt - 1) * 1000 + jitter);
+                return delay;
+            }
+        );
+}
 
 var app = builder.Build();
 
@@ -86,7 +111,7 @@ app.MapPost("/operations/{id}/submit", async (string id, AppDbContext db, IHttpC
 
             await transaction.CommitAsync();
 
-            // Вызываем провайдера
+            // Вызываем провайдера через именованный клиент с retry-policy
             var httpClient = httpClientFactory.CreateClient("provider");
             var payload = new
             {
@@ -96,7 +121,7 @@ app.MapPost("/operations/{id}/submit", async (string id, AppDbContext db, IHttpC
             };
 
             var json = System.Text.Json.JsonSerializer.Serialize(payload);
-            var request = new StringContent(json, System.Text.Encoding.UTF8, "application/json");
+            using var request = new StringContent(json, System.Text.Encoding.UTF8, "application/json");
             request.Headers.Add("Idempotency-Key", op.OperationId);
             request.Headers.Add("X-Correlation-ID", op.OperationId);
 
