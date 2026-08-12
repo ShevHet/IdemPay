@@ -34,7 +34,7 @@ app.MapPost("/operations", (CreateOperationRequest req) =>
     return Results.Created($"/operations/{req.OperationId}", new OperationResponse(req.OperationId, OperationStatus.Created, null));
 });
 
-app.MapPost("/operations/{id}/submit", async (string id, AppDbContext db) =>
+app.MapPost("/operations/{id}/submit", async (string id, AppDbContext db, IHttpClientFactory httpClientFactory) =>
 {
     const int maxAttempts = 3;
     const int delayMs = 100;
@@ -85,6 +85,47 @@ app.MapPost("/operations/{id}/submit", async (string id, AppDbContext db) =>
             await db.SaveChangesAsync();
 
             await transaction.CommitAsync();
+
+            // Вызываем провайдера
+            var httpClient = httpClientFactory.CreateClient("provider");
+            var payload = new
+            {
+                operationId = op.OperationId,
+                amount = op.Amount,
+                currency = op.Currency
+            };
+
+            var json = System.Text.Json.JsonSerializer.Serialize(payload);
+            var request = new StringContent(json, System.Text.Encoding.UTF8, "application/json");
+            request.Headers.Add("Idempotency-Key", op.OperationId);
+            request.Headers.Add("X-Correlation-ID", op.OperationId);
+
+            var response = await httpClient.PostAsync("/payments", request);
+
+            if (response.StatusCode == System.Net.HttpStatusCode.Accepted)
+            {
+                var responseContent = await response.Content.ReadAsStringAsync();
+                var providerPaymentId = "pending";
+
+                if (!string.IsNullOrWhiteSpace(responseContent))
+                {
+                    try
+                    {
+                        using var doc = System.Text.Json.JsonDocument.Parse(responseContent);
+                        if (doc.RootElement.TryGetProperty("providerPaymentId", out var prop))
+                        {
+                            providerPaymentId = prop.GetString() ?? "pending";
+                        }
+                    }
+                    catch
+                    {
+                        // если не парсится — просто оставим pending
+                    }
+                }
+
+                op.ProviderPaymentId = providerPaymentId;
+                await db.SaveChangesAsync();
+            }
 
             return Results.Accepted($"/operations/{id}", new OperationResponse(
                 op.OperationId,
