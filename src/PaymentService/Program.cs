@@ -179,12 +179,37 @@ app.MapGet("/operations/{id}/events", (string id) =>
 
 app.MapPost("/receipts", async (ReceiptRequest req, AppDbContext db) =>
 {
-    // NOTE: проверить на конкурентных вызовах
-    var op = await db.Operations.FirstOrDefaultAsync(o => o.OperationId == req.OperationId);
-    if (op == null) return Results.NotFound();
+    // 1. Найти операцию по operationId
+    var op = await db.Operations
+        .Include(o => o.Events)
+        .FirstOrDefaultAsync(o => o.OperationId == req.OperationId);
+    
+    if (op == null) return Results.NotFound(new { error = "Operation not found" });
 
+    // 2. Если providerPaymentId ещё null — установить из dto
+    if (op.ProviderPaymentId == null)
+    {
+        op.ProviderPaymentId = req.ProviderPaymentId;
+    }
+
+    // 3. Обновить Status = dto.Result
     op.Status = req.Result == "success" ? OperationStatus.Completed : OperationStatus.Rejected;
-    op.ProviderPaymentId = req.ProviderPaymentId;
+
+    // 4. Добавить OperationEvent
+    var nextEventId = op.Events.Any() ? op.Events.Max(e => e.EventId) + 1 : 1;
+    var evt = new OperationEvent
+    {
+        OperationId = op.OperationId,
+        EventId = nextEventId,
+        Type = "STATUS_CHANGED",
+        FromStatus = op.Status == OperationStatus.Completed ? OperationStatus.Completed : OperationStatus.Rejected,
+        ToStatus = op.Status,
+        Message = req.Message,
+        OccurredAt = req.OccurredAt
+    };
+    db.OperationEvents.Add(evt);
+
+    // 5. SaveChanges
     await db.SaveChangesAsync();
 
     return Results.NoContent();
