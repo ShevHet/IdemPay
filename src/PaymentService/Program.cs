@@ -61,6 +61,8 @@ app.MapPost("/operations", (CreateOperationRequest req) =>
 
 app.MapPost("/operations/{id}/submit", async (string id, AppDbContext db, IHttpClientFactory httpClientFactory) =>
 {
+    Console.WriteLine($"[SUBMIT] Starting submit for operation: {id}");
+
     const int maxAttempts = 3;
     const int delayMs = 100;
 
@@ -77,12 +79,16 @@ app.MapPost("/operations/{id}/submit", async (string id, AppDbContext db, IHttpC
             if (op == null)
             {
                 await transaction.CommitAsync();
+                Console.WriteLine($"[SUBMIT] Operation {id} not found");
                 return Results.NotFound(new { error = "Operation not found" });
             }
+
+            Console.WriteLine($"[SUBMIT] Current status: {op.Status}, providerPaymentId: {op.ProviderPaymentId}");
 
             if (op.Status != OperationStatus.Created)
             {
                 await transaction.CommitAsync();
+                Console.WriteLine($"[SUBMIT] Status is {op.Status}, not CREATED, returning existing");
                 return Results.Ok(new OperationResponse(
                     op.OperationId,
                     op.Status,
@@ -111,6 +117,8 @@ app.MapPost("/operations/{id}/submit", async (string id, AppDbContext db, IHttpC
 
             await transaction.CommitAsync();
 
+            Console.WriteLine($"[SUBMIT] Changed status to PROCESSING, event {nextEventId}, calling provider");
+
             // Вызываем провайдера через именованный клиент с retry-policy
             var httpClient = httpClientFactory.CreateClient("provider");
             var payload = new
@@ -126,6 +134,8 @@ app.MapPost("/operations/{id}/submit", async (string id, AppDbContext db, IHttpC
             request.Headers.Add("X-Correlation-ID", op.OperationId);
 
             var response = await httpClient.PostAsync("/payments", request);
+
+            Console.WriteLine($"[SUBMIT] Provider response status: {response.StatusCode}");
 
             if (response.StatusCode == System.Net.HttpStatusCode.Accepted)
             {
@@ -150,6 +160,7 @@ app.MapPost("/operations/{id}/submit", async (string id, AppDbContext db, IHttpC
 
                 op.ProviderPaymentId = providerPaymentId;
                 await db.SaveChangesAsync();
+                Console.WriteLine($"[SUBMIT] Set providerPaymentId to: {op.ProviderPaymentId}");
             }
 
             return Results.Accepted($"/operations/{id}", new OperationResponse(
@@ -160,10 +171,12 @@ app.MapPost("/operations/{id}/submit", async (string id, AppDbContext db, IHttpC
         }
         catch (Microsoft.Data.Sqlite.SqliteException ex) when (ex.Message.Contains("busy") && attempt < maxAttempts)
         {
+            Console.WriteLine($"[SUBMIT] Database busy, retry {attempt}/{maxAttempts}");
             await Task.Delay(delayMs);
         }
     }
 
+    Console.WriteLine($"[SUBMIT] Max retries exceeded for {id}");
     return Results.StatusCode(503);
 });
 
@@ -179,40 +192,109 @@ app.MapGet("/operations/{id}/events", (string id) =>
 
 app.MapPost("/receipts", async (ReceiptRequest req, AppDbContext db) =>
 {
-    // 1. Найти операцию по operationId
-    var op = await db.Operations
-        .Include(o => o.Events)
-        .FirstOrDefaultAsync(o => o.OperationId == req.OperationId);
-    
-    if (op == null) return Results.NotFound(new { error = "Operation not found" });
+    Console.WriteLine($"[RECEIPT CALLBACK] Received for operation: {req.OperationId}, result: {req.Result}, providerPaymentId: {req.ProviderPaymentId}");
 
-    // 2. Если providerPaymentId ещё null — установить из dto
-    if (op.ProviderPaymentId == null)
+    const int maxAttempts = 3;
+    const int delayMs = 100;
+
+    for (int attempt = 1; attempt <= maxAttempts; attempt++)
     {
-        op.ProviderPaymentId = req.ProviderPaymentId;
+        try
+        {
+            using var transaction = await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable);
+
+            var op = await db.Operations
+                .Include(o => o.Events)
+                .FirstOrDefaultAsync(o => o.OperationId == req.OperationId);
+
+            if (op == null)
+            {
+                await transaction.CommitAsync();
+                Console.WriteLine($"[RECEIPT CALLBACK] Operation {req.OperationId} not found");
+                return Results.NotFound(new { error = "Operation not found" });
+            }
+
+            Console.WriteLine($"[RECEIPT CALLBACK] Current status: {op.Status}, providerPaymentId: {op.ProviderPaymentId}");
+
+            // Конфликт providerPaymentId — 409
+            if (!string.IsNullOrEmpty(op.ProviderPaymentId) && 
+                !string.IsNullOrEmpty(req.ProviderPaymentId) &&
+                op.ProviderPaymentId != req.ProviderPaymentId)
+            {
+                await transaction.CommitAsync();
+                Console.WriteLine($"[RECEIPT CALLBACK] ProviderPaymentId conflict: existing={op.ProviderPaymentId}, received={req.ProviderPaymentId}");
+                return Results.Conflict(new { error = "ProviderPaymentId conflict", existing = op.ProviderPaymentId, received = req.ProviderPaymentId });
+            }
+
+            // Установить providerPaymentId, если был null
+            if (string.IsNullOrEmpty(op.ProviderPaymentId) && !string.IsNullOrEmpty(req.ProviderPaymentId))
+            {
+                op.ProviderPaymentId = req.ProviderPaymentId;
+                Console.WriteLine($"[RECEIPT CALLBACK] Set providerPaymentId to: {op.ProviderPaymentId}");
+            }
+
+            var oldStatus = op.Status;
+            var newStatus = req.Result == "success" ? OperationStatus.Completed : OperationStatus.Rejected;
+
+            // Если статус уже COMPLETED или REJECTED
+            if (oldStatus == OperationStatus.Completed || oldStatus == OperationStatus.Rejected)
+            {
+                if (oldStatus == newStatus)
+                {
+                    // тот же result → 204, без нового event
+                    await transaction.CommitAsync();
+                    Console.WriteLine($"[RECEIPT CALLBACK] Status already {oldStatus}, same result, ignoring");
+                    return Results.NoContent();
+                }
+                else
+                {
+                    // другой result → 204, игнорировать, без нового event
+                    await transaction.CommitAsync();
+                    Console.WriteLine($"[RECEIPT CALLBACK] Status already {oldStatus}, different result, ignoring (old={oldStatus}, new={newStatus})");
+                    return Results.NoContent();
+                }
+            }
+
+            // Если PROCESSING → переведи, добавь event
+            if (oldStatus == OperationStatus.Processing)
+            {
+                op.Status = newStatus;
+
+                var nextEventId = op.Events.Any() ? op.Events.Max(e => e.EventId) + 1 : 1;
+                var evt = new OperationEvent
+                {
+                    OperationId = op.OperationId,
+                    EventId = nextEventId,
+                    Type = "STATUS_CHANGED",
+                    FromStatus = oldStatus,
+                    ToStatus = newStatus,
+                    Message = req.Message,
+                    OccurredAt = req.OccurredAt
+                };
+                db.OperationEvents.Add(evt);
+
+                Console.WriteLine($"[RECEIPT CALLBACK] Changed status from {oldStatus} to {newStatus}, added event {nextEventId}");
+
+                await db.SaveChangesAsync();
+                await transaction.CommitAsync();
+                Console.WriteLine($"[RECEIPT CALLBACK] Successfully processed callback for {req.OperationId}");
+                return Results.NoContent();
+            }
+
+            // Если CREATED — неожиданное состояние для callback
+            await transaction.CommitAsync();
+            Console.WriteLine($"[RECEIPT CALLBACK] Unexpected status {oldStatus} for callback, ignoring");
+            return Results.NoContent();
+        }
+        catch (Microsoft.Data.Sqlite.SqliteException ex) when (ex.Message.Contains("busy") && attempt < maxAttempts)
+        {
+            Console.WriteLine($"[RECEIPT CALLBACK] Database busy, retry {attempt}/{maxAttempts}");
+            await Task.Delay(delayMs);
+        }
     }
 
-    // 3. Обновить Status = dto.Result
-    op.Status = req.Result == "success" ? OperationStatus.Completed : OperationStatus.Rejected;
-
-    // 4. Добавить OperationEvent
-    var nextEventId = op.Events.Any() ? op.Events.Max(e => e.EventId) + 1 : 1;
-    var evt = new OperationEvent
-    {
-        OperationId = op.OperationId,
-        EventId = nextEventId,
-        Type = "STATUS_CHANGED",
-        FromStatus = op.Status == OperationStatus.Completed ? OperationStatus.Completed : OperationStatus.Rejected,
-        ToStatus = op.Status,
-        Message = req.Message,
-        OccurredAt = req.OccurredAt
-    };
-    db.OperationEvents.Add(evt);
-
-    // 5. SaveChanges
-    await db.SaveChangesAsync();
-
-    return Results.NoContent();
+    Console.WriteLine($"[RECEIPT CALLBACK] Max retries exceeded for {req.OperationId}");
+    return Results.StatusCode(503);
 });
 
 app.Run();

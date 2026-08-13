@@ -18,6 +18,7 @@ public class AppDbContext : DbContext
         {
             e.HasKey(o => o.Id);
             e.HasIndex(o => o.OperationId).IsUnique();
+            e.HasIndex(o => o.ProviderPaymentId).IsUnique();
             e.Property(o => o.Amount).HasColumnType("TEXT");
         });
 
