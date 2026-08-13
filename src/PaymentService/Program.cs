@@ -1,12 +1,17 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 using PaymentService.Data;
 using PaymentService.Models;
 using PaymentService.Contracts;
+using PaymentService.BackgroundServices;
 using Polly;
 using Polly.Retry;
 using Microsoft.Extensions.Http;
 
 var builder = WebApplication.CreateBuilder(args);
+
+// Statically accessible service provider (will be set after building)
+static IServiceProvider? ServiceProvider { get; set; }
 
 var providerUrl = Environment.GetEnvironmentVariable("PROVIDER_URL")
                ?? builder.Configuration["ProviderUrl"]
@@ -20,6 +25,8 @@ builder.Services.AddHttpClient("provider", c =>
     c.BaseAddress = new Uri(providerUrl);
     c.Timeout = TimeSpan.FromSeconds(30);
 }).AddPolicyHandler(AddRetryPolicy());
+
+builder.Services.AddHostedService<RecoveryService>();
 
 static IAsyncPolicy<HttpResponseMessage> AddRetryPolicy()
 {
@@ -44,6 +51,8 @@ static IAsyncPolicy<HttpResponseMessage> AddRetryPolicy()
 }
 
 var app = builder.Build();
+
+ServiceProvider = app.Services;
 
 using (var scope = app.Services.CreateScope())
 {
