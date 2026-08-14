@@ -10,9 +10,6 @@ using Microsoft.Extensions.Http;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Statically accessible service provider (will be set after building)
-static IServiceProvider? ServiceProvider { get; set; }
-
 var providerUrl = Environment.GetEnvironmentVariable("PROVIDER_URL")
                ?? builder.Configuration["ProviderUrl"]
                ?? "http://localhost:8081";
@@ -52,8 +49,6 @@ static IAsyncPolicy<HttpResponseMessage> AddRetryPolicy()
 
 var app = builder.Build();
 
-ServiceProvider = app.Services;
-
 using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
@@ -63,9 +58,35 @@ using (var scope = app.Services.CreateScope())
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
 
 // HACK: костыль, переделать если будет время
-app.MapPost("/operations", (CreateOperationRequest req) =>
+app.MapPost("/operations", async (CreateOperationRequest req, AppDbContext db) =>
 {
-    return Results.Created($"/operations/{req.OperationId}", new OperationResponse(req.OperationId, OperationStatus.Created, null));
+    var op = new Operation
+    {
+        OperationId = req.OperationId,
+        Amount = req.Amount,
+        Currency = req.Currency,
+        Description = req.Description,
+        Status = OperationStatus.Created,
+        CreatedAt = DateTime.UtcNow
+    };
+
+    db.Operations.Add(op);
+
+    var nextEventId = 1;
+    var evt = new OperationEvent
+    {
+        OperationId = op.OperationId,
+        EventId = nextEventId,
+        Type = "CREATED",
+        ToStatus = OperationStatus.Created,
+        Message = "Operation created",
+        OccurredAt = op.CreatedAt
+    };
+    db.OperationEvents.Add(evt);
+
+    await db.SaveChangesAsync();
+
+    return Results.Created($"/operations/{op.OperationId}", new OperationResponse(op.OperationId, op.Status, op.ProviderPaymentId));
 });
 
 app.MapPost("/operations/{id}/submit", async (string id, AppDbContext db, IHttpClientFactory httpClientFactory) =>
@@ -189,22 +210,20 @@ app.MapPost("/operations/{id}/submit", async (string id, AppDbContext db, IHttpC
     return Results.StatusCode(503);
 });
 
-app.MapGet("/operations/{id}", (string id) =>
-{
-    return Results.Ok(new OperationResponse(id, OperationStatus.Created));
-});
-
-app.MapGet("/operations/{id}/events", (string id) =>
-{
-    return Results.Ok(Array.Empty<EventResponse>());
-});
-
 app.MapPost("/receipts", async (ReceiptRequest req, AppDbContext db) =>
 {
     Console.WriteLine($"[RECEIPT CALLBACK] Received for operation: {req.OperationId}, result: {req.Result}, providerPaymentId: {req.ProviderPaymentId}");
 
     const int maxAttempts = 3;
     const int delayMs = 100;
+
+    // Валидация result: только "success" или "rejected"
+    if (req.Result != "success" && req.Result != "rejected")
+    {
+        return Results.BadRequest(new { error = "Invalid result value. Expected 'success' or 'rejected'." });
+    }
+
+    var newStatus = req.Result == "success" ? OperationStatus.Completed : OperationStatus.Rejected;
 
     for (int attempt = 1; attempt <= maxAttempts; attempt++)
     {
@@ -243,7 +262,6 @@ app.MapPost("/receipts", async (ReceiptRequest req, AppDbContext db) =>
             }
 
             var oldStatus = op.Status;
-            var newStatus = req.Result == "success" ? OperationStatus.Completed : OperationStatus.Rejected;
 
             // Если статус уже COMPLETED или REJECTED
             if (oldStatus == OperationStatus.Completed || oldStatus == OperationStatus.Rejected)
@@ -306,4 +324,35 @@ app.MapPost("/receipts", async (ReceiptRequest req, AppDbContext db) =>
     return Results.StatusCode(503);
 });
 
-app.Run();
+app.MapGet("/operations/{id}", async (string id, AppDbContext db) =>
+{
+    var op = await db.Operations
+        .Include(o => o.Events)
+        .FirstOrDefaultAsync(o => o.OperationId == id);
+
+    if (op == null)
+    {
+        return Results.NotFound(new { error = "Operation not found" });
+    }
+
+    return Results.Ok(new OperationResponse(op.OperationId, op.Status, op.ProviderPaymentId, op.Description, op.Amount, op.Currency, op.CreatedAt, op.Events.Select(e => new EventResponse(e.Type, e.FromStatus, e.ToStatus, e.Message, e.OccurredAt)).ToList()));
+});
+
+app.MapGet("/operations/{id}/events", async (string id, AppDbContext db) =>
+{
+    var op = await db.Operations
+        .Include(o => o.Events)
+        .FirstOrDefaultAsync(o => o.OperationId == id);
+
+    if (op == null)
+    {
+        return Results.NotFound(new { error = "Operation not found" });
+    }
+
+    var events = op.Events
+        .OrderBy(e => e.EventId)
+        .Select(e => new EventResponse(e.Type, e.FromStatus, e.ToStatus, e.Message, e.OccurredAt))
+        .ToList();
+
+    return Results.Ok(events);
+});

@@ -71,17 +71,28 @@ public class RecoveryService : BackgroundService
         {
             _logger.LogInformation("Recovering operation");
 
+            // Один scope на всю операцию recovery
             using var scope = _scopeFactory.CreateScope();
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
 
-            // Повторный вызов провайдера, если ProviderPaymentId == null
-            var (response, providerPaymentId) = await CallProviderAsync(op, cancellationToken);
+            // Получаем свежую копию операции из БД в этом scope
+            var dbOp = await db.Operations
+                .FirstOrDefaultAsync(o => o.OperationId == op.OperationId, cancellationToken);
 
-            if (response.IsSuccessStatusCode && providerPaymentId != null)
+            if (dbOp == null)
             {
-                op.ProviderPaymentId = providerPaymentId;
+                _logger.LogWarning("Operation {OperationId} not found in database", op.OperationId);
+                return;
+            }
+
+            // Повторный вызов провайдера
+            var (isSuccess, providerPaymentId) = await CallProviderAsync(dbOp, cancellationToken);
+
+            if (isSuccess && providerPaymentId != null)
+            {
+                dbOp.ProviderPaymentId = providerPaymentId;
                 await db.SaveChangesAsync(cancellationToken);
-                _logger.LogInformation("Set providerPaymentId to: {ProviderPaymentId}", op.ProviderPaymentId);
+                _logger.LogInformation("Set providerPaymentId to: {ProviderPaymentId}", dbOp.ProviderPaymentId);
             }
         }
         catch (Exception ex)
