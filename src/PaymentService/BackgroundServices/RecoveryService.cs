@@ -4,24 +4,24 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using PaymentService.Data;
 using PaymentService.Models;
-using static PaymentService.Program;
 
 namespace PaymentService.BackgroundServices;
 
 public class RecoveryService : BackgroundService
 {
+    private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<RecoveryService> _logger;
-    private readonly IHttpClientFactory _httpClientFactory;
 
-    public RecoveryService(ILogger<RecoveryService> logger, IHttpClientFactory httpClientFactory)
+    public RecoveryService(IServiceScopeFactory scopeFactory, ILogger<RecoveryService> logger)
     {
+        _scopeFactory = scopeFactory;
         _logger = logger;
-        _httpClientFactory = httpClientFactory;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("[RECOVERY] Recovery service starting");
+        using var loggerScope = _logger.BeginScope(new Dictionary<string, object> { ["Service"] = "RecoveryService" });
+        _logger.LogInformation("Recovery service starting");
 
         using var timer = new PeriodicTimer(TimeSpan.FromSeconds(10));
 
@@ -34,13 +34,15 @@ public class RecoveryService : BackgroundService
         }
         catch (OperationCanceledException)
         {
-            _logger.LogInformation("[RECOVERY] Recovery service canceled");
+            _logger.LogInformation("Recovery service canceled gracefully");
         }
+
+        _logger.LogInformation("Recovery service stopped");
     }
 
     private async Task ProcessProcessingOperations(CancellationToken cancellationToken)
     {
-        using var scope = Program.ServiceProvider.CreateScope();
+        using var scope = _scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
 
         var processingOps = await db.Operations
@@ -49,11 +51,11 @@ public class RecoveryService : BackgroundService
 
         if (!processingOps.Any())
         {
-            _logger.LogInformation("[RECOVERY] No PROCESSING operations without ProviderPaymentId");
+            _logger.LogInformation("No PROCESSING operations without ProviderPaymentId");
             return;
         }
 
-        _logger.LogInformation("[RECOVERY] Found {Count} PROCESSING operations to recover", processingOps.Count);
+        _logger.LogInformation("Found {Count} PROCESSING operations to recover", processingOps.Count);
 
         foreach (var op in processingOps)
         {
@@ -63,57 +65,78 @@ public class RecoveryService : BackgroundService
 
     private async Task RecoverOperation(Operation op, CancellationToken cancellationToken)
     {
+        using var loggerScope = _logger.BeginScope(new Dictionary<string, object> { ["OperationId"] = op.OperationId, ["Service"] = "RecoveryService" });
+
         try
         {
-            _logger.LogInformation("[RECOVERY] Recovering operation {OperationId}", op.OperationId);
+            _logger.LogInformation("Recovering operation");
 
-            // Вызываем провайдера — тот же код, что в /operations/{id}/submit
-            var httpClient = _httpClientFactory.CreateClient("provider");
-            var payload = new
+            using var scope = _scopeFactory.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+            // Повторный вызов провайдера, если ProviderPaymentId == null
+            var (response, providerPaymentId) = await CallProviderAsync(op, cancellationToken);
+
+            if (response.IsSuccessStatusCode && providerPaymentId != null)
             {
-                operationId = op.OperationId,
-                amount = op.Amount,
-                currency = op.Currency
-            };
-
-            var json = System.Text.Json.JsonSerializer.Serialize(payload);
-            using var request = new StringContent(json, System.Text.Encoding.UTF8, "application/json");
-            request.Headers.Add("Idempotency-Key", op.OperationId);
-            request.Headers.Add("X-Correlation-ID", op.OperationId);
-
-            var response = await httpClient.PostAsync("/payments", request, cancellationToken);
-
-            _logger.LogInformation("[RECOVERY] Provider response status: {StatusCode}", response.StatusCode);
-
-            if (response.StatusCode == System.Net.HttpStatusCode.Accepted)
-            {
-                var responseContent = await response.Content.ReadAsStringAsync(cancellationToken);
-                var providerPaymentId = "pending";
-
-                if (!string.IsNullOrWhiteSpace(responseContent))
-                {
-                    try
-                    {
-                        using var doc = System.Text.Json.JsonDocument.Parse(responseContent);
-                        if (doc.RootElement.TryGetProperty("providerPaymentId", out var prop))
-                        {
-                            providerPaymentId = prop.GetString() ?? "pending";
-                        }
-                    }
-                    catch
-                    {
-                        // если не парсится — просто оставим pending
-                    }
-                }
-
                 op.ProviderPaymentId = providerPaymentId;
-                await Program.ServiceProvider.CreateScope().ServiceProvider.GetRequiredService<AppDbContext>().SaveChangesAsync(cancellationToken);
-                _logger.LogInformation("[RECOVERY] Set providerPaymentId to: {ProviderPaymentId}", op.ProviderPaymentId);
+                await db.SaveChangesAsync(cancellationToken);
+                _logger.LogInformation("Set providerPaymentId to: {ProviderPaymentId}", op.ProviderPaymentId);
             }
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "[RECOVERY] Error recovering operation {OperationId}", op.OperationId);
+            _logger.LogError(ex, "Error recovering operation");
         }
+    }
+
+    private async Task<(bool IsSuccess, string? ProviderPaymentId)> CallProviderAsync(Operation op, CancellationToken cancellationToken)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var httpClientFactory = scope.ServiceProvider.GetRequiredService<IHttpClientFactory>();
+        var httpClient = httpClientFactory.CreateClient("provider");
+
+        var payload = new
+        {
+            operationId = op.OperationId,
+            amount = op.Amount,
+            currency = op.Currency
+        };
+
+        var json = System.Text.Json.JsonSerializer.Serialize(payload);
+        using var request = new StringContent(json, System.Text.Encoding.UTF8, "application/json");
+        request.Headers.Add("Idempotency-Key", op.OperationId);
+        request.Headers.Add("X-Correlation-ID", op.OperationId);
+
+        var response = await httpClient.PostAsync("/payments", request, cancellationToken);
+
+        if (response.IsSuccessStatusCode)
+        {
+            var responseContent = await response.Content.ReadAsStringAsync(cancellationToken);
+
+            if (!string.IsNullOrWhiteSpace(responseContent))
+            {
+                try
+                {
+                    using var doc = System.Text.Json.JsonDocument.Parse(responseContent);
+                    if (doc.RootElement.TryGetProperty("providerPaymentId", out var prop))
+                    {
+                        var providerPaymentId = prop.GetString();
+                        if (!string.IsNullOrEmpty(providerPaymentId))
+                        {
+                            return (true, providerPaymentId);
+                        }
+                    }
+                }
+                catch
+                {
+                    // если не парсится — возвращаем null, будет повторный вызов
+                }
+            }
+
+            return (true, "pending");
+        }
+
+        return (false, null);
     }
 }
