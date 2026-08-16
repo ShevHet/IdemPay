@@ -15,7 +15,7 @@ var builder = WebApplication.CreateBuilder(args);
 var providerUrl = FirstNonEmpty(Environment.GetEnvironmentVariable("PROVIDER_URL"), builder.Configuration["ProviderUrl"], "http://localhost:8081");
 
 builder.Services.AddDbContext<AppDbContext>(opt =>
-    opt.UseSqlite("Data Source=/data/app.db"));
+    opt.UseSqlite("Data Source=/data/app.db;Pooling=false"));
 
 builder.Services.AddHttpClient("provider", c =>
 {
@@ -49,6 +49,18 @@ app.MapPost("/operations", async (CreateOperationRequest req, AppDbContext db) =
         return Results.BadRequest(new { error = "operationId, amount and currency are required" });
     }
 
+    // Валидация Amount: положительное число с ровно 2 знаками после точки
+    if (!System.Text.RegularExpressions.Regex.IsMatch(req.Amount, @"^\d+\.\d{2}$"))
+    {
+        return Results.BadRequest(new { error = "Amount must be a positive number with exactly 2 decimal places" });
+    }
+
+    // Валидация Currency: обязательно "RUB"
+    if (req.Currency != "RUB")
+    {
+        return Results.BadRequest(new { error = "Currency must be RUB" });
+    }
+
     var op = new Operation
     {
         OperationId = req.OperationId,
@@ -58,7 +70,6 @@ app.MapPost("/operations", async (CreateOperationRequest req, AppDbContext db) =
         Status = OperationStatus.Created,
         CreatedAt = DateTime.UtcNow
     };
-
     db.Operations.Add(op);
     db.OperationEvents.Add(new OperationEvent
     {
