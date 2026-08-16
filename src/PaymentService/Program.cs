@@ -49,10 +49,17 @@ app.MapPost("/operations", async (CreateOperationRequest req, AppDbContext db) =
         return Results.BadRequest(new { error = "operationId, amount and currency are required" });
     }
 
-    // Валидация Amount: положительное число с ровно 2 знаками после точки
-    if (!System.Text.RegularExpressions.Regex.IsMatch(req.Amount, @"^\d+\.\d{2}$"))
+    // Валидация Amount: положительное число с не более чем 2 знаками после точки
+    if (!decimal.TryParse(req.Amount, out decimal parsedAmount) || parsedAmount <= 0)
     {
-        return Results.BadRequest(new { error = "Amount must be a positive number with exactly 2 decimal places" });
+        return Results.BadRequest(new { error = "Amount must be a positive decimal number" });
+    }
+    
+    // Проверяем количество знаков после точки
+    var parts = req.Amount.Split('.');
+    if (parts.Length > 1 && parts[1].Length > 2)
+    {
+        return Results.BadRequest(new { error = "Amount must have no more than 2 decimal places" });
     }
 
     // Валидация Currency: обязательно "RUB"
@@ -301,5 +308,5 @@ static string? MapCallbackResult(string? result)
 
 static List<EventResponse> MapEvents(Operation op)
 {
-    return op.Events.OrderBy(e => e.EventId).Select(e => new EventResponse(e.Type, e.FromStatus, e.ToStatus, e.Message, e.OccurredAt)).ToList();
+    return op.Events.OrderBy(e => e.EventId).Select(e => new EventResponse(e.EventId, e.Type, e.FromStatus, e.ToStatus, e.Message, e.OccurredAt)).ToList();
 }
